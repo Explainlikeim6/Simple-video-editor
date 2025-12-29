@@ -16,3 +16,5 @@ A tiny, no-backend **browser-based video editor** built as a single HTML file.
 5. Click **Download** to export
 
 ---
+
+Most of the code was made by GLM 4.7 from z.ai and changes on the timeline style and exportation codecs by chatgpt 5.2 from openai.
