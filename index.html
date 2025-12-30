@@ -545,6 +545,45 @@ function formatTime(seconds) {
         }
 
         // --- Export Logic (With Audio) ---
+
+        // Export format selection:
+        // - We *prefer* MP4/H.264/AAC when the browser can record it directly.
+        // - Otherwise we fall back to WebM (VP9/VP8), and we always save using the correct file extension.
+        const EXPORT_PRESETS = [
+            { mime: 'video/mp4;codecs="avc1.42E01E,mp4a.40.2"', ext: 'mp4', label: 'MP4 (H.264/AAC)' },
+            { mime: 'video/mp4;codecs="avc1.64001F,mp4a.40.2"', ext: 'mp4', label: 'MP4 (H.264/AAC)' },
+            { mime: 'video/mp4', ext: 'mp4', label: 'MP4' },
+            { mime: 'video/webm;codecs=vp9,opus', ext: 'webm', label: 'WebM (VP9/Opus)' },
+            { mime: 'video/webm;codecs=vp8,opus', ext: 'webm', label: 'WebM (VP8/Opus)' },
+            { mime: 'video/webm', ext: 'webm', label: 'WebM' }
+        ];
+
+        function pickBestExportPreset() {
+            if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
+                return { mime: 'video/webm', ext: 'webm', label: 'WebM' };
+            }
+            for (const p of EXPORT_PRESETS) {
+                if (MediaRecorder.isTypeSupported(p.mime)) return p;
+            }
+            return { mime: 'video/webm', ext: 'webm', label: 'WebM' };
+        }
+
+        // Heuristic bitrate picker for nicer quality across different crop sizes.
+        // Clamps to a reasonable range so tiny crops don't look over-compressed and large crops don't explode file size.
+        function recommendVideoBitrate(w, h, fps) {
+            const pixelsPerSecond = Math.max(1, Math.floor(w * h * fps));
+            const bitsPerPixel = 0.12; // good default for screen/video content at ~30fps
+            const bps = Math.round(pixelsPerSecond * bitsPerPixel);
+            return Math.min(Math.max(bps, 2000000), 12000000);
+        }
+
+        function extFromMime(mime, fallbackExt = 'webm') {
+            if (!mime) return fallbackExt;
+            if (mime.includes('mp4')) return 'mp4';
+            if (mime.includes('webm')) return 'webm';
+            return fallbackExt;
+        }
+
         async function startExport() {
             state.isExporting = true;
             elements.overlay.style.display = 'flex';
@@ -560,6 +599,7 @@ function formatTime(seconds) {
 
             // 2. Setup Streams
             const canvasStream = elements.canvas.captureStream(30);
+            const canvasVideoTrack = canvasStream.getVideoTracks()[0];
 
             // Capture Audio from Video Element
             let audioStream;
@@ -575,44 +615,93 @@ function formatTime(seconds) {
                 canvasStream.addTrack(audioStream.getAudioTracks()[0]);
             }
 
-            // 3. Setup Recorder
-            let mimeType = 'video/webm;codecs=vp9';
-            if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm;codecs=vp8';
-            if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
-            if (MediaRecorder.isTypeSupported('video/mp4')) mimeType = 'video/mp4';
+                        // 3. Setup Recorder (pick the best supported format + correct file extension)
+            const preset = pickBestExportPreset();
+            const mimeType = preset.mime;
+            const fileExt = preset.ext;
 
-            const recorder = new MediaRecorder(canvasStream, {
-                mimeType: mimeType,
-                videoBitsPerSecond: 5000000
-            });
+            // MediaRecorder can create files that are hard to seek if keyframes are too sparse.
+// Newer Chrome supports keyframe interval options; we try them, and fall back if unsupported.
+const recOptions = {
+    mimeType,
+    videoBitsPerSecond: recommendVideoBitrate(elements.canvas.width, elements.canvas.height, 30),
+    audioBitsPerSecond: 128000,
+    // Aim for a keyframe about every 1s to make seeking in players (e.g. VLC) much cleaner.
+    // If unsupported, the constructor will throw and we retry without it.
+    videoKeyFrameIntervalDuration: 500
+};
 
-            const chunks = [];
-            recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-            recorder.onstop = () => finishExport(chunks, mimeType, originalWidth, originalHeight);
+let recorder;
+try {
+    recorder = new MediaRecorder(canvasStream, recOptions);
+} catch (err) {
+    delete recOptions.videoKeyFrameIntervalDuration;
+    recorder = new MediaRecorder(canvasStream, recOptions);
+}
+
+const chunks = [];
+recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+recorder.onstop = () => finishExport(chunks, mimeType, fileExt, preset.label, originalWidth, originalHeight);
+
 
             // 4. Start Recording
-            elements.video.currentTime = state.trimStart;
+            // Seek to trimStart and wait for it to complete (helps keep timestamps monotonic/clean)
+            await new Promise(resolve => {
+                const onSeeked = () => resolve();
+                elements.video.addEventListener('seeked', onSeeked, { once: true });
+                elements.video.currentTime = state.trimStart;
+            });
+
             elements.video.muted = false; // Essential for audio capture
             elements.video.volume = 0; // Keep it quiet for the user, but not strictly muted
-            await new Promise(r => setTimeout(r, 200));
+            await new Promise(r => setTimeout(r, 50));
 
             recorder.start();
-            elements.video.play();
+            await elements.video.play();
 
-            function exportRenderLoop() {
-                if (elements.video.paused || elements.video.ended) return;
-
-                // Draw cropped frame to resized canvas
+            const drawCroppedFrame = () => {
                 elements.ctx.drawImage(
                     elements.video,
-                    state.crop.x, state.crop.y, state.crop.w, state.crop.h, // Source (The area from original video)
-                    0, 0, elements.canvas.width, elements.canvas.height    // Dest (Full new canvas)
+                    state.crop.x, state.crop.y, state.crop.w, state.crop.h, // Source
+                    0, 0, elements.canvas.width, elements.canvas.height    // Dest
                 );
-                requestAnimationFrame(exportRenderLoop);
-            }
-            exportRenderLoop();
+                // Some browsers expose requestFrame() on the canvas capture track.
+                // Calling it after we draw helps avoid duplicate frames / weird pacing.
+                if (canvasVideoTrack && typeof canvasVideoTrack.requestFrame === 'function') {
+                    canvasVideoTrack.requestFrame();
+                }
+            };
 
-            // Monitor
+            let stopRequested = false;
+            const maybeStop = () => {
+                if (stopRequested) return;
+                if (elements.video.currentTime >= state.trimEnd || elements.video.ended) {
+                    stopRequested = true;
+                    recorder.stop();
+                    elements.video.pause();
+                }
+            };
+
+            // Prefer requestVideoFrameCallback (draw only on decoded video frames) when available.
+            if (typeof elements.video.requestVideoFrameCallback === 'function') {
+                const onFrame = () => {
+                    if (elements.video.paused || elements.video.ended || stopRequested) return;
+                    drawCroppedFrame();
+                    maybeStop();
+                    if (!stopRequested) elements.video.requestVideoFrameCallback(onFrame);
+                };
+                elements.video.requestVideoFrameCallback(onFrame);
+            } else {
+                function exportRenderLoop() {
+                    if (elements.video.paused || elements.video.ended || stopRequested) return;
+                    drawCroppedFrame();
+                    maybeStop();
+                    if (!stopRequested) requestAnimationFrame(exportRenderLoop);
+                }
+                exportRenderLoop();
+            }
+
+// Monitor
             const checkInterval = setInterval(() => {
                 const current = elements.video.currentTime;
                 const total = state.trimEnd - state.trimStart;
@@ -621,21 +710,27 @@ function formatTime(seconds) {
                 document.querySelector('.progress-text').innerText = `Processing... ${Math.floor(progress)}%`;
                 document.querySelector('.progress-sub').innerText = formatTime(current) + " / " + formatTime(state.trimEnd);
 
-                if (current >= state.trimEnd || elements.video.ended) {
-                    clearInterval(checkInterval);
-                    recorder.stop();
-                    elements.video.pause();
-                }
+                if (stopRequested || recorder.state !== 'recording') {
+    clearInterval(checkInterval);
+    return;
+}
+
+if (current >= state.trimEnd || elements.video.ended) {
+    maybeStop();
+    if (stopRequested) clearInterval(checkInterval);
+}
             }, 100);
         }
 
-        function finishExport(chunks, mimeType, origW, origH) {
+        function finishExport(chunks, mimeType, fileExt, label, origW, origH) {
             const blob = new Blob(chunks, { type: mimeType });
+            const actualExt = extFromMime(blob.type, fileExt);
+            const filename = `cropped-video_${Date.now()}.${actualExt}`;
             const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
+const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `cropped-video_${Date.now()}.mp4`;
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             
@@ -653,8 +748,12 @@ elements.video.currentTime = state.trimStart;
 elements.video.volume = 1;
 renderLoop();
 updateDisplays();
-showToast('Video Downloaded!');
-            }, 100);
+showToast(
+                    actualExt === 'mp4'
+                        ? `Video downloaded as ${label}.`
+                        : `Video downloaded as ${label} (MP4 recording not supported in this browser).`
+                );
+}, 100);
         }
 
         function showToast(msg) {
