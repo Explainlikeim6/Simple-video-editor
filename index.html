@@ -159,6 +159,11 @@
 
     <div id="toast" class="toast">Action Successful</div>
 
+    <script type="module">
+        import { webmFixDuration } from 'https://cdn.skypack.dev/webm-fix-duration';
+        window.webmFixDuration = webmFixDuration;
+    </script>
+
     <script>
         // --- Constants & State ---
         const HANDLE_SIZE = 12;
@@ -722,38 +727,56 @@ if (current >= state.trimEnd || elements.video.ended) {
             }, 100);
         }
 
-        function finishExport(chunks, mimeType, fileExt, label, origW, origH) {
+        async function finishExport(chunks, mimeType, fileExt, label, origW, origH) {
             const blob = new Blob(chunks, { type: mimeType });
             const actualExt = extFromMime(blob.type, fileExt);
-            const filename = `cropped-video_${Date.now()}.${actualExt}`;
-            const url = URL.createObjectURL(blob);
-const a = document.createElement('a');
+
+            // Optional "remux/metadata-fix" step for WebM:
+            // MediaRecorder WebM can be missing/incorrect duration metadata, which makes seeking in players unreliable.
+            // This doesn't re-encode; it just fixes/rewrites container metadata.
+            let outBlob = blob;
+            if (actualExt === 'webm' && typeof window.webmFixDuration === 'function') {
+                try {
+                    const durationMs = Math.round((state.trimEnd - state.trimStart) * 1000);
+                    document.querySelector('.progress-text').innerText = 'Finalizing (fixing WebM metadata)...';
+                    document.querySelector('.progress-sub').innerText = '';
+                    outBlob = await window.webmFixDuration(blob, durationMs, blob.type);
+                } catch (e) {
+                    console.warn('webmFixDuration failed; downloading original WebM.', e);
+                }
+            }
+
+            const outExt = extFromMime(outBlob.type, actualExt);
+            const filename = `cropped-video_${Date.now()}.${outExt}`;
+            const url = URL.createObjectURL(outBlob);
+
+            const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
             a.download = filename;
             document.body.appendChild(a);
             a.click();
-            
+
             setTimeout(() => {
                 document.body.removeChild(a);
                 URL.revokeObjectURL(url);
                 elements.overlay.style.display = 'none';
                 state.isExporting = false;
-                
+
                 // Restore Canvas
                 elements.canvas.width = origW;
                 elements.canvas.height = origH;
-                
-elements.video.currentTime = state.trimStart;
-elements.video.volume = 1;
-renderLoop();
-updateDisplays();
-showToast(
-                    actualExt === 'mp4'
+
+                elements.video.currentTime = state.trimStart;
+                elements.video.volume = 1;
+                renderLoop();
+                updateDisplays();
+                showToast(
+                    outExt === 'mp4'
                         ? `Video downloaded as ${label}.`
-                        : `Video downloaded as ${label} (MP4 recording not supported in this browser).`
+                        : `Video downloaded as ${label} (WebM metadata fixed for better seeking).`
                 );
-}, 100);
+            }, 100);
         }
 
         function showToast(msg) {
